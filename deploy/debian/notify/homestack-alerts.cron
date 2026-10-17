@@ -1,0 +1,14 @@
+# Server alerts and jobs for Homestack. Installed as /etc/cron.d/homestack-alerts.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/10 * * * *  root  disk-temp-check
+17 * * * *    root  space-check
+37 * * * *    root  smart-check
+0 3 * * *     root  mover
+
+# SnapRAID parity: remove the # from these two lines after the first manual
+# `snapraid sync` has finished. With the host agent, turn them on in Homestack's
+# Schedules page instead.
+#30 4 * * *   root  snapraid-job sync
+#0 6 * * 0    root  snapraid-job scrub

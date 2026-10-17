@@ -1,0 +1,45 @@
+# scripts/check.sh on every push to main and every pull request: the same
+# checks as the pre-push hook (formatting, vet, staticcheck, known
+# vulnerabilities, the tests, the web UI's checks and build, shellcheck, the
+# third-party notices, and every dependency on its latest release). Weekly
+# too, so a new vulnerability or release shows up without a push.
+#
+# Actions are pinned to the commit of a release (noted beside it), so a moved
+# tag can't change what runs.
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable # check.sh fails unless it's the latest release
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: The latest npm
+        run: npm install -g npm@latest --no-audit --no-fund
+
+      - name: Checks
+        run: bash scripts/check.sh

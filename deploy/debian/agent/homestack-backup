@@ -1,0 +1,5 @@
+#!/bin/bash
+# The nightly backup (Schedules → Backup): asks the host agent to save one to
+# the backups folder (Settings → Backups). The agent records the result and
+# sends an alert if it fails. Installed by deploy/debian/agent/install.sh.
+exec /usr/local/lib/homestack/homestack backup "$@"

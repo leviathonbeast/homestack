@@ -1,0 +1,14 @@
+#!/bin/bash
+# upsmon's SHUTDOWNCMD (runs as root): stop what shouldn't be cut off, then
+# power off. systemd then stops containers and VMs (libvirt-guests), unmounts
+# and exports the pools, and NUT tells the UPS to cut its outlets so the
+# server boots again when mains returns. Installed as /usr/local/sbin/ups-shutdown.
+logger -t ups-shutdown "UPS shutdown starting"
+# A parity job gets SIGINT, like the Stop button, so SnapRAID saves progress.
+if pgrep -x snapraid >/dev/null; then
+  pkill -INT -x snapraid
+  for _ in $(seq 60); do pgrep -x snapraid >/dev/null || break; sleep 1; done
+fi
+# The mover: let rsync finish the file it's on, the rest waits for next time.
+pkill -TERM -f '^/bin/bash /usr/local/sbin/mover' 2>/dev/null
+exec /bin/systemctl poweroff

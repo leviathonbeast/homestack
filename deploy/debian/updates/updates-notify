@@ -1,0 +1,49 @@
+#!/bin/bash
+# Posts to Discord after the daily automatic security update: what was
+# installed, anything that went wrong, and when a reboot is needed (with a
+# reminder every 7 days until you reboot). Nothing is sent on days with no
+# updates. Runs after apt-daily-upgrade.service (a systemd drop-in).
+N=${NOTIFY:-/usr/local/sbin/notify-discord}
+LOG=${UU_LOG:-/var/log/unattended-upgrades/unattended-upgrades.log}
+STATE=${STATE_DIR:-/var/lib/homestack-alerts}/updates
+REBOOT=${REBOOT_FILE:-/var/run/reboot-required}
+mkdir -p "$STATE"
+
+# The last run in the log: everything after its "Starting" line.
+if [ -r "$LOG" ]; then
+  start=$(grep -n 'Starting unattended upgrades script' "$LOG" | tail -1)
+  line=${start%%:*}
+  stamp=$(cut -c1-19 <<<"${start#*:}")
+  if [ -n "$line" ] && [ "$stamp" != "$(cat "$STATE/last-run" 2>/dev/null)" ]; then
+    run=$(tail -n +"$line" "$LOG")
+    pkgs=$(sed -n 's/.*Packages that will be upgraded: //p' <<<"$run" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+    problems=$(grep -E ' (ERROR|WARNING) ' <<<"$run" | sed -E 's/^[0-9-]+ [0-9:,]+ (ERROR|WARNING) //' | head -8)
+    if grep -q 'Installing the upgrades failed' <<<"$run"; then
+      "$N" -l error -t "Security updates failed" \
+        "$(printf 'These didn'"'"'t install: %s\n\n%s\n\nSee /var/log/unattended-upgrades/unattended-upgrades-dpkg.log' "$(tr '\n' ' ' <<<"$pkgs" | sed 's/ $//')" "$problems")"
+    elif [ -n "$pkgs" ]; then
+      n=$(wc -l <<<"$pkgs")
+      msg="Installed $n package$([ "$n" = 1 ] || echo s): $(tr '\n' ' ' <<<"$pkgs" | sed 's/ $//' | sed 's/ /, /g')."
+      [ -n "$problems" ] && msg+=$'\n\n'"Notes:"$'\n'"$problems"
+      "$N" -l success -t "Security updates installed" "$msg"
+    elif [ -n "$problems" ]; then
+      "$N" -l warning -t "Security updates need a look" "$problems"
+    fi
+    echo "$stamp" > "$STATE/last-run"
+  fi
+fi
+
+# Reboot needed? Say so once, then remind weekly.
+if [ -e "$REBOOT" ]; then
+  last=$(cat "$STATE/reboot-notified" 2>/dev/null || echo 0)
+  if (( $(date +%s) - last > 7 * 86400 )); then
+    why=$(sort -u "$REBOOT.pkgs" 2>/dev/null | tr '\n' ' ' | sed 's/ $//' | sed 's/ /, /g')
+    again=$([ "$last" = 0 ] || echo " (reminder)")
+    "$N" -l warning -t "Reboot needed$again" \
+      "A security update${why:+ to $why} only takes effect after a reboot. Use Storage → Reboot in Homestack when it suits you: it stops containers, VMs and the array cleanly first." \
+      && date +%s > "$STATE/reboot-notified"
+  fi
+else
+  rm -f "$STATE/reboot-notified"
+fi
+exit 0

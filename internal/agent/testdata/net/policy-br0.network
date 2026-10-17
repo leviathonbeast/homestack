@@ -1,0 +1,88 @@
+# Services link: br0 on the 10G bond, keeping the server's familiar 10.0.10.5 so
+# every app link, share and client keeps working. Samba, Docker apps and LAN
+# traffic use it (its LAN route has the lower metric), anything sent from
+# 10.0.10.5 or from a container leaves this way (table 100), and it's the
+# fallback default route if the management port is down.
+# (The VMs' VLAN 40 bridge is set up from bond0, in 20-bond0.network.)
+[Match]
+Name=br0
+
+[Network]
+IPv6AcceptRA=no
+IPv6PrivacyExtensions=no
+DNS=1.1.1.2 193.138.219.74 45.90.28.0
+DNS=2620:fe::11 2a07:e340::4 2606:4700:4700::1112
+ConfigureWithoutCarrier=yes
+
+[Address]
+Address=10.0.10.5/24
+RouteMetric=100
+
+[Address]
+Address=2001:db8:0:8a00::5/64
+RouteMetric=100
+
+# Fallback default route (the management port's one wins while it's up).
+[Route]
+Gateway=10.0.10.1
+Metric=500
+
+[Route]
+Gateway=fe80::1
+GatewayOnLink=yes
+Metric=500
+
+# Table 100: the services link's own routes.
+[Route]
+Destination=10.0.10.0/24
+Scope=link
+Table=100
+
+[Route]
+Gateway=10.0.10.1
+Table=100
+
+[Route]
+Destination=2001:db8:0:8a00::/64
+Table=100
+
+[Route]
+Gateway=fe80::1
+GatewayOnLink=yes
+Table=100
+
+# From 10.0.10.5: specific routes (LAN, Docker bridges) from the main table,
+# the default route from table 100.
+[RoutingPolicyRule]
+From=10.0.10.5/32
+Table=main
+SuppressPrefixLength=0
+Priority=100
+
+[RoutingPolicyRule]
+From=10.0.10.5/32
+Table=100
+Priority=101
+
+[RoutingPolicyRule]
+From=2001:db8:0:8a00::5/128
+Table=main
+SuppressPrefixLength=0
+Priority=100
+
+[RoutingPolicyRule]
+From=2001:db8:0:8a00::5/128
+Table=100
+Priority=101
+
+# Docker containers' internet traffic (downloads, updates) also uses the 10G link.
+[RoutingPolicyRule]
+From=172.16.0.0/12
+Table=main
+SuppressPrefixLength=0
+Priority=110
+
+[RoutingPolicyRule]
+From=172.16.0.0/12
+Table=100
+Priority=111

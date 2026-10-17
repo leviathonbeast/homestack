@@ -1,0 +1,134 @@
+#!/bin/bash
+# Watches the SMART values that really predict trouble and explains any
+# change in plain English. Sleeping disks are skipped, never woken.
+#
+# Tuned for Seagate and WD:
+#  - Seagate packs several counters into attributes 1 (Raw_Read_Error_Rate),
+#    7 (Seek_Error_Rate) and 195 (Hardware_ECC_Recovered), so their huge raw
+#    numbers are normal and ignored. 187 (Reported_Uncorrect) is watched: on
+#    Seagate it's one of the best early signs of a failing disk.
+#  - On WD, 1 (Raw_Read_Error_Rate) is a real count that should stay 0, and
+#    200 (Multi_Zone_Error_Rate) counts write errors; both are watched.
+#  - Both: 5 reallocated, 197 pending, 198 uncorrectable, 199 cable (CRC)
+#    errors, and head parking (193) passing half its rated 600,000 cycles.
+#  - SATA SSDs (Samsung, Crucial, WD Blue…): wear from the drive's endurance
+#    statistic, or Samsung's Wear_Leveling_Count (177) / Crucial's
+#    Percent_Lifetime_Remain (202) and similar; failed flash blocks (program
+#    and erase failures, Samsung's runtime bad blocks). Crucial MX500s are
+#    known to flick attribute 197 between 0 and 1, so a single pending sector
+#    on a Crucial SSD is ignored.
+#  - NVMe (Samsung, Crucial P-series…): media errors, spare blocks, critical
+#    warnings and wear, from the standard NVMe health log.
+# Runs hourly from /etc/cron.d/homestack-alerts.
+. "${ALERTS_CONF:-/etc/default/homestack-alerts}" 2>/dev/null
+. "${ALERTS_LIB:-/usr/local/lib/homestack/alerts-lib.sh}"
+N=${NOTIFY:-/usr/local/sbin/notify-discord}
+STATE=${STATE_DIR:-/var/lib/homestack-alerts}/smart
+mkdir -p "$STATE"
+load_labels
+
+while read -r d tran; do
+  [ "$tran" = usb ] && continue
+  rot=$(cat "${SYSFS:-/sys}/block/$d/queue/rotational" 2>/dev/null)
+  if [[ $d == nvme* ]]; then j=$(smartctl -n standby -H -A -j "/dev/$d" 2>/dev/null)
+  else j=$(smartctl -n standby -H -A -l devstat -j "/dev/$d" 2>/dev/null); fi
+  jq -e '.smart_status' >/dev/null 2>&1 <<<"$j" || continue    # asleep or no SMART
+  serial=$(jq -r '.serial_number // empty' <<<"$j"); serial=${serial:-$d}
+  f="$STATE/$serial"
+  attr() { jq -r --argjson id "$1" '[.ata_smart_attributes.table[]? | select(.id == $id) | .raw.value][0] // empty' <<<"$j"; }
+  nv()   { jq -r ".nvme_smart_health_information_log.$1 // empty" <<<"$j"; }
+  # SATA SSD helpers: attributes found by name, since each maker numbers them differently.
+  max_by_name() { jq -r --arg re "$1" '[.ata_smart_attributes.table[]? | select(.name | test($re)) | .raw.value] | if length == 0 then empty else max end' <<<"$j"; }
+  ssd_used() {
+    local v
+    v=$(jq -r '[.ata_device_statistics.pages[]?.table[]? | select(.name == "Percentage Used Endurance Indicator") | .value][0] // empty' <<<"$j")
+    [[ "$v" =~ ^[0-9]+$ ]] && { echo "$v"; return; }
+    v=$(jq -r '[.ata_smart_attributes.table[]? | select(.name | test("^(Wear_Leveling_Count|Percent_Lifetime_Remain|SSD_Life_Left|Media_Wearout_Indicator|Percent_Life_Remaining|Remaining_Lifetime_Perc)$")) | .value][0] // empty' <<<"$j")
+    [[ "$v" =~ ^[0-9]+$ ]] && (( v <= 100 )) && echo $((100 - v))
+  }
+
+  model=$(jq -r '.model_name // ""' <<<"$j") family=$(jq -r '.model_family // ""' <<<"$j")
+  case "$model $family" in
+    ST*|*Seagate*) vendor=seagate ;;
+    WD*|*Western\ Digital*) vendor=wd ;;
+    Samsung*|*Samsung*) vendor=samsung ;;
+    CT*|Crucial*|*Crucial*|*Micron*) vendor=crucial ;;
+    *) vendor=other ;;
+  esac
+  declare -A now=(
+    [health]=$(jq -r 'if .smart_status.passed then "ok" else "failed" end' <<<"$j")
+    [realloc]=$(attr 5) [pending]=$(attr 197) [offline]=$(attr 198) [crc]=$(attr 199)
+    [uncorrect]=$(attr 187) [lcc]=$(attr 193)
+    [wd_read]=$([ $vendor = wd ] && [ "$rot" = 1 ] && attr 1) [wd_write]=$([ $vendor = wd ] && [ "$rot" = 1 ] && attr 200)
+    [ssd_bad]=$([ "$rot" = 0 ] && max_by_name '^(Program_Fail|Erase_Fail|Runtime_Bad_Block|Used_Rsvd_Blk_Cnt_Tot)')
+    [media]=$(nv media_errors) [used]=$(if [[ $d == nvme* ]]; then nv percentage_used; elif [ "$rot" = 0 ]; then ssd_used; fi) [spare]=$(nv available_spare)
+    [spare_thr]=$(nv available_spare_threshold) [critical]=$(nv critical_warning)
+  )
+  declare -A was=()
+  if [ -f "$f" ]; then while IFS='=' read -r k v; do was[$k]=$v; done < "$f"; fi
+  first=$([ -f "$f" ] && echo no || echo yes)
+  for k in "${!now[@]}"; do echo "$k=${now[$k]}"; done > "$f"
+
+  lines=() level=warning
+  up() { # key: did the counter go up since last time (or start above 0)?
+    local n=${now[$1]} w=${was[$1]:-0}
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    if [ "$first" = yes ]; then (( n > 0 )); else (( n > w )); fi
+  }
+  from() { local w=${was[$1]:-0}; [ "$first" = yes ] && echo "${now[$1]}" || echo "$w → ${now[$1]}"; }
+
+  if [ "${now[health]}" = failed ] && [ "${was[health]}" != failed ]; then
+    level=error
+    lines+=("**The disk says it is failing** (SMART overall health: FAILED). Replace it soon, and make sure everything on it is backed up or protected by parity.")
+  fi
+  if [ $vendor = crucial ] && [ "$rot" = 0 ] && (( ${now[pending]:-0} <= 1 )); then now[pending]=0; fi   # MX500 firmware quirk
+  up pending && lines+=("**Unreadable sectors: $(from pending).** The disk couldn't read some spots. When they're written again they either work or get swapped for spares. A handful can be harmless; a number that keeps rising means the disk is going.")
+  up offline && lines+=("**Uncorrectable sectors: $(from offline).** Spots the disk's own background scan couldn't read at all. Any data stored there is damaged, unless ZFS or parity can rebuild it.")
+  up realloc && lines+=("**Replaced sectors: $(from realloc).** The disk has swapped bad spots for spares. A few over a disk's life is normal; a steady climb means it's wearing out.")
+  up crc && { lines+=("**Cable errors: $(from crc).** Data got garbled between the disk and the controller. This is almost always the **cable or connector, not the disk**: reseat or replace it."); }
+  up uncorrect && lines+=("**Errors the disk couldn't correct: $(from uncorrect).** Reads that failed even after the disk's own error correction.$([ $vendor = seagate ] && echo " On Seagate drives this is one of the most reliable early signs of a failing disk.")")
+  if [ $vendor = wd ]; then
+    up wd_read && lines+=("**Read errors: $(from wd_read).** On WD drives this counter normally stays at 0.")
+    up wd_write && lines+=("**Write errors: $(from wd_write).** WD's Multi-Zone Error Rate: data that didn't write cleanly. A few are tolerable; a steady rise points to a failing head or surface.")
+  fi
+  if [[ "${now[lcc]}" =~ ^[0-9]+$ ]] && (( now[lcc] >= 300000 )) && (( ${was[lcc]:-0} < 300000 )) && [ "$first" = no ]; then
+    lines+=("**Head parking passed 300,000 cycles** (${now[lcc]}; NAS drives are rated for about 600,000). Normal for an older disk, but a sign of its age.")
+  fi
+  up media && { level=error; lines+=("**Media errors: $(from media).** The SSD failed to read or write some data correctly.") ; }
+  if [[ "${now[critical]}" =~ ^[1-9] ]] && [ "${was[critical]:-0}" = 0 ]; then
+    level=error; lines+=("**The SSD raised a critical warning** (code ${now[critical]}): it may be overheating, out of spare blocks or read-only.")
+  fi
+  up ssd_bad && lines+=("**Failed flash blocks: $(from ssd_bad).** The SSD retired blocks that failed to program or erase. It has spares for this, but a rising count means the flash is wearing out.")
+  wear=${SSD_WEAR_WARN:-80}
+  if [[ "${now[used]}" =~ ^[0-9]+$ ]] && (( now[used] >= wear )) && (( ${was[used]:-0} < wear )); then
+    lines+=("**The SSD has used ${now[used]}% of its rated write life.** Most keep working past 100%, but plan a replacement.")
+  fi
+  if [[ "${now[spare]}" =~ ^[0-9]+$ ]] && [[ "${now[spare_thr]}" =~ ^[0-9]+$ ]] && (( now[spare] <= now[spare_thr] )) && (( ${was[spare]:-100} > now[spare_thr] )); then
+    level=error; lines+=("**The SSD is almost out of spare blocks** (${now[spare]}% left). Replace it.")
+  fi
+  [ ${#lines[@]} -eq 0 ] && continue
+  poh=$(jq -r '.power_on_time.hours // empty' <<<"$j") temp=$(jq -r '.temperature.current // empty' <<<"$j")
+  ctx="${family:-$model}"
+  [[ "$poh" =~ ^[0-9]+$ ]] && ctx+=" · $(awk -v h="$poh" 'BEGIN{printf "%.1f years powered on", h/8766}')"
+  [ -n "$temp" ] && ctx+=" · ${temp}°C"
+
+  name=$(disk_name "$d")
+  advice="**What to do:**"$'\n'
+  if [ "$name" = cache ]; then
+    advice+="• Run \`btrfs scrub start -B $STORAGE_CACHE\`: it reads everything on the cache and reports any damaged file."$'\n'
+  elif zpool list "$name" >/dev/null 2>&1; then
+    advice+="• Run \`zpool scrub $name\`: ZFS reads everything on the disk and tells you if any file is damaged."$'\n'
+  fi
+  if [ "${#lines[@]}" -eq 1 ] && [[ "${lines[0]}" == *"Cable errors"* ]]; then
+    advice+="• Check the cable at both ends (motherboard/HBA and disk). If the number keeps rising, swap the cable."
+  else
+    if [ "$rot" = 1 ]; then
+      advice+="• Start a full surface test: \`smartctl -t long /dev/$d\` (takes a day or more on a big disk; check it with \`smartctl -a /dev/$d\`)."$'\n'
+    else
+      advice+="• Start the SSD's self-test: \`smartctl -t long /dev/$d\` (a few minutes; check it with \`smartctl -a /dev/$d\`)."$'\n'
+    fi
+    advice+="• If these numbers keep going up, replace the disk. Check your backups now."
+  fi
+  body="$(disk_desc "$d")"$'\n'"-# $ctx"$'\n\n'"$(printf '%s\n\n' "${lines[@]}")"$'\n\n'"$advice"
+  "$N" -l "$level" -t "Disk warning: $name" "$body" || rm -f "$f"   # not sent: try again next hour
+done < <(lsblk -dno NAME,TYPE,TRAN | awk '$2 == "disk" {print $1, $3}')

@@ -1,0 +1,9 @@
+Global: 192.168.65.7
+Link 2 (eth0):
+Link 3 (port0):
+Link 4 (br0): 1.1.1.2 193.138.219.74
+Link 5 (br0.40):
+Link 6 (port1):
+Link 7 (mgmt0): 1.1.1.2
+Link 8 (bond0):
+Link 9 (bond0.40):

@@ -1,0 +1,14 @@
+# Keeps smartctl's drive database current: monthly, at a random time that
+# day, and after a boot if the server was off when it was due.
+# Installed by deploy/debian/agent/install.sh.
+
+[Unit]
+Description=Update smartctl's drive database monthly
+
+[Timer]
+OnCalendar=monthly
+RandomizedDelaySec=12h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,42 @@
+#!/bin/bash
+# smartd hook: explains smartd's warnings (health check failed, self-test
+# failed, new errors logged, disk unreachable) in plain English.
+# Installed as /etc/smartmontools/run.d/60homestack; smartd-runner runs it.
+N=${NOTIFY:-/usr/local/sbin/notify-discord}
+[ -x "$N" ] || exit 0
+. "${ALERTS_LIB:-/usr/local/lib/homestack/alerts-lib.sh}"
+load_labels
+d=${SMARTD_DEVICE#/dev/}
+name=$(disk_name "$d")
+level=warning
+case "$SMARTD_FAILTYPE" in
+  EmailTest)
+    level=success title="SMART alerts are working"
+    text="smartd can reach Discord. You'll get a message like this if this disk reports a problem." ;;
+  Health|FailedHealthCheck)
+    level=error title="Disk failing: $name"
+    text="**The disk says it is failing** (SMART overall health: FAILED). Replace it as soon as you can, and make sure what's on it is backed up or protected by parity." ;;
+  SelfTest)
+    level=error title="Disk self-test failed: $name"
+    text="The disk's own surface test found an area it **can't read**. Run \`zpool scrub $name\` to find any damaged files, and plan to replace the disk." ;;
+  ErrorCount)
+    title="Disk logged new errors: $name"
+    text="The disk recorded new read/write errors. A one-off is often a cable or power blip. If it happens again, check the cable, then run \`smartctl -t long /dev/$d\`." ;;
+  CurrentPendingSector|OfflineUncorrectableSector)
+    title="Unreadable sectors: $name"
+    text="The disk has spots it can't read. A handful can be harmless; if the number keeps rising the disk is failing. Run \`zpool scrub $name\` to check your files." ;;
+  Usage)
+    title="Disk wear warning: $name"
+    text="One of the disk's health values has crossed its manufacturer's limit. It's an early warning: keep an eye on it and plan a replacement." ;;
+  Temperature)
+    title="Disk temperature: $name"
+    text="The disk is hotter than smartd's limit. Check fans and airflow." ;;
+  FailedOpenDevice|FailedReadSmartData|FailedReadSmartErrorLog|FailedReadSmartSelfTestLog)
+    level=error title="Can't read disk: $name"
+    text="smartd can no longer talk to this disk. It may have dropped off the controller or lost power. Check \`zpool status\` and \`dmesg | tail -50\`, then reseat its cables." ;;
+  *)
+    title="SMART warning: $name"
+    text="smartd reported a problem with this disk." ;;
+esac
+detail=$(tr -s ' \n' ' ' <<<"${SMARTD_MESSAGE:-}" | cut -c1-300)
+"$N" -l "$level" -t "$title" "$(disk_desc "$d")"$'\n\n'"$text"${detail:+$'\n\n'"-# smartd: $detail"}

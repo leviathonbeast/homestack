@@ -1,0 +1,46 @@
+#!/bin/bash
+# Reports filesystems and ZFS pools that are nearly full, once when they
+# cross the limit and once when they're back under it. Also reports any pool
+# that isn't healthy, in case a ZFS event was missed. Runs hourly.
+. "${ALERTS_CONF:-/etc/default/homestack-alerts}" 2>/dev/null
+: "${SPACE_WARN:=90}"
+N=${NOTIFY:-/usr/local/sbin/notify-discord}
+STATE=${STATE_DIR:-/var/lib/homestack-alerts}/space
+mkdir -p "$STATE"
+
+check() { # name percent-used detail
+  local f
+  f="$STATE/$(echo "$1" | tr '/ ' '__')"
+  if (( $2 >= SPACE_WARN )); then
+    [ -f "$f" ] || { "$N" -l warning -t "Low space: $1" "$1 is **$2% full**. $3" && touch "$f"; }
+  elif (( $2 <= SPACE_WARN - 2 )) && [ -f "$f" ]; then
+    "$N" -l success -t "Space OK: $1" "$1 is back to $2% full. $3" && rm -f "$f"
+  fi
+}
+
+# The boot drive, Docker's folder, the cache and every unassigned disk (the
+# storage layout, written by the agent), plus any others in SPACE_MOUNTS.
+. "${LAYOUT_CONF:-/etc/default/homestack-layout}" 2>/dev/null
+mounts=(/ "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)" "${STORAGE_CACHE:-/mnt/cache}")
+while IFS= read -r m; do mounts+=("$m"); done < <(findmnt -rno TARGET | awk -v d="${STORAGE_UNASSIGNED:-/mnt/disks}/" 'index($0, d) == 1')
+read -ra extra <<<"${SPACE_MOUNTS:-}"
+mounts+=("${extra[@]}")
+declare -A seen
+for m in "${mounts[@]}"; do
+  [ -n "$m" ] && [ -z "${seen[$m]}" ] || continue
+  seen[$m]=1
+  mountpoint -q "$m" || continue
+  read -r pct avail < <(df -h --output=pcent,avail "$m" | tail -1 | tr -d '%')
+  check "$m" "$pct" "$avail left."
+done
+while read -r name cap free; do
+  check "pool $name" "${cap%\%}" "$free free."
+done < <(zpool list -Ho name,cap,free 2>/dev/null)
+
+f="$STATE/zpool-health"
+bad=$(zpool status -x 2>/dev/null)
+if [ -n "$bad" ] && ! grep -q "all pools are healthy" <<<"$bad"; then
+  [ -f "$f" ] || { "$N" -l error -t "ZFS pool problem" "$(head -c 1800 <<<"$bad")" && touch "$f"; }
+elif [ -f "$f" ]; then
+  "$N" -l success -t "ZFS pools healthy again" "zpool status -x: all pools are healthy" && rm -f "$f"
+fi

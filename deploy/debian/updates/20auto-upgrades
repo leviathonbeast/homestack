@@ -1,0 +1,4 @@
+// Installed by deploy/debian/updates/install.sh (same as answering Yes in
+// dpkg-reconfigure unattended-upgrades).
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";

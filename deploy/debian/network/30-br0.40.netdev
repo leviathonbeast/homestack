@@ -1,0 +1,8 @@
+# br0.40: the bridge your VMs plug into (StepCA, OpenSUSE, Debian, gui).
+[NetDev]
+Name=br0.40
+Kind=bridge
+
+[Bridge]
+STP=no
+ForwardDelaySec=0

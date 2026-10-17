@@ -1,0 +1,24 @@
+// Automatic security updates only. Installed as /etc/apt/apt.conf.d/52homestack-updates
+// by deploy/debian/updates/install.sh.
+
+// Security updates only (normal updates are installed by hand)
+#clear Unattended-Upgrade::Origins-Pattern;
+Unattended-Upgrade::Origins-Pattern {
+  "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+};
+
+// Never touch the kernel, ZFS or Docker: a kernel or ZFS update needs checking
+// (dkms status) before a reboot, and a Docker update restarts every container.
+Unattended-Upgrade::Package-Blacklist {
+  "^linux-";
+  "^zfs";
+  "^libzfs";
+  "^libzpool";
+  "^spl";
+  "^docker-";
+  "^containerd";
+};
+
+// Reboots go through Homestack (Storage -> Reboot), which stops everything cleanly.
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";

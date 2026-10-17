@@ -1,0 +1,8 @@
+# The host has no address on VLAN 40, exactly like on Unraid.
+[Match]
+Name=br0.40
+
+[Network]
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+ConfigureWithoutCarrier=yes

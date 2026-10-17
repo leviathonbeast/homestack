@@ -1,0 +1,35 @@
+#!/bin/bash
+# Post a message to the Discord channel set up in Homestack (Settings →
+# Notifications). Used by the server's own jobs: ZFS, SMART, temperatures,
+# disk space and the mover.
+#
+#   notify-discord [-l info|success|warning|error] [-t TITLE] [MESSAGE...]
+#   some-command | notify-discord -l error -t "Something failed"
+#
+# Sends nothing (and exits 0) while notifications are off in Homestack.
+level=info title=""
+while getopts "l:t:" o; do
+  case $o in l) level=$OPTARG ;; t) title=$OPTARG ;; *) echo "usage: notify-discord [-l level] [-t title] [message]" >&2; exit 2 ;; esac
+done
+shift $((OPTIND - 1))
+msg="$*"
+[ -z "$msg" ] && [ ! -t 0 ] && msg=$(head -c 60000)
+[ -z "$msg" ] && [ -z "$title" ] && { echo "notify-discord: nothing to send" >&2; exit 2; }
+args=(notify -level "$level")
+[ -n "$title" ] && args+=(-title "$title")
+
+logger -t notify-discord -- "[$level] ${title:+$title: }${msg//$'\n'/ | }"
+
+# Homestack's container is the normal route: it always has the current webhook.
+if docker inspect -f '{{.State.Running}}' homestack 2>/dev/null | grep -q true; then
+  printf '%s' "$msg" | docker exec -i homestack homestack "${args[@]}" && exit 0
+fi
+# Fallback while Homestack's container is down (a copy made by install.sh),
+# reading its settings where the agent says they are.
+if [ -x /usr/local/lib/homestack/homestack ]; then
+  [ -n "${HOMESTACK_DATA:-}" ] || . "${LAYOUT_CONF:-/etc/default/homestack-layout}" 2>/dev/null
+  printf '%s' "$msg" | HOMESTACK_DATA=${HOMESTACK_DATA:-/mnt/cache/appdata/homestack} \
+    /usr/local/lib/homestack/homestack "${args[@]}" && exit 0
+fi
+echo "notify-discord: couldn't send (is Homestack running?)" >&2
+exit 1

@@ -1,0 +1,259 @@
+#!/bin/bash
+# Runs SnapRAID with notifications when it starts, finishes or fails.
+#   snapraid-job sync [--force]   update parity (nightly)
+#   snapraid-job scrub            check part of the array against parity (weekly)
+# Before syncing it checks how many files were deleted or modified since the
+# last sync, and stops if it's more than SNAPRAID_DELETE_LIMIT or
+# SNAPRAID_UPDATE_LIMIT, so an accident (or ransomware encrypting files)
+# can't be written into parity. Rerun with --force if intended.
+. "${ALERTS_CONF:-/etc/default/homestack-alerts}" 2>/dev/null
+# Settings → Storage → Parity overrides those (written by the agent).
+. "${PARITY_CONF:-/etc/default/homestack-parity}" 2>/dev/null
+: "${SNAPRAID_DELETE_LIMIT:=500}" "${SNAPRAID_UPDATE_LIMIT:=1000}" "${SNAPRAID_SCRUB_PERCENT:=8}" "${SNAPRAID_SCRUB_AGE:=10}"
+N=${NOTIFY:-/usr/local/sbin/notify-discord}
+job=${1:-sync}
+force=no; [ "$2" = --force ] && force=yes
+log=/var/log/snapraid-$job.log
+
+# One storage task at a time: the mover, parity jobs, flatten-dataset and
+# Homestack's array controls all share this lock.
+array_lock() { # name
+  exec 9>>/run/lock/homestack-array.lock
+  flock -n 9 || return 1
+  : > /run/lock/homestack-array.lock; echo "$1" >> /run/lock/homestack-array.lock
+}
+json_str() { # text → a JSON string (first 600 bytes)
+  local s; s=$(printf '%s' "$1" | head -c 600)
+  jq -n --arg s "$s" '$s' 2>/dev/null || python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$s" 2>/dev/null || echo '""'
+}
+# One log per run in $RUN_LOGS (Homestack: Storage → History), so a new
+# run never wipes the last one. The fixed path ($2) links to the latest run;
+# older runs are compressed, and the newest LOG_KEEP of each kind are kept.
+start_run_log() { # action fixed-path
+  local dir=${RUN_LOGS:-/var/log/homestack-agent/runs} keep=${LOG_KEEP:-30} f
+  if ! mkdir -p "$dir" 2>/dev/null; then rm -f "$2"; RUNLOG=$2 RUNJSON=""; : > "$RUNLOG"; return 0; fi
+  # A log from before run logs existed becomes the oldest run.
+  if [ -f "$2" ] && [ ! -L "$2" ]; then mv -f "$2" "$dir/$1-$(date -r "$2" +%Y%m%d-%H%M%S).log"; fi
+  for f in "$dir/$1"-*.log; do [ -e "$f" ] && gzip -qf "$f"; done
+  # shellcheck disable=SC2012 # only our own names: <action>-<timestamp>[-<job>].log.gz
+  ls -1t "$dir/$1"-*.log.gz 2>/dev/null | tail -n +"$keep" | while read -r f; do rm -f -- "$f" "${f%.log.gz}.json"; done
+  RUNLOG="$dir/$1-$(date +%Y%m%d-%H%M%S)${HOMESTACK_AGENT_JOB:+-$HOMESTACK_AGENT_JOB}.log"
+  RUNJSON="${RUNLOG%.log}.json"
+  : > "$RUNLOG"
+  ln -sfn "$RUNLOG" "$2"
+}
+run_result() { # ok(true/false) summary: how this run ended, next to its log
+  [ -n "${RUNLOG:-}" ] || return 0
+  echo "== $([ "$1" = true ] && echo OK || echo FAILED): $2" >> "$RUNLOG"
+  [ -n "$RUNJSON" ] && printf '{"finished":"%s","ok":%s,"summary":%s}\n' "$(date -Iseconds)" "$1" "$(json_str "$2")" > "$RUNJSON"
+  return 0
+}
+record_result() { # action ok(true/false) summary: for Homestack's Storage page
+  run_result "$2" "$3"
+  local d=${HOMESTACK_STATE:-/var/lib/homestack-agent} j; mkdir -p "$d" 2>/dev/null || return 0
+  j=$(printf '{"finished":"%s","ok":%s,"summary":%s}' "$(date -Iseconds)" "$2" "$(json_str "$3")")
+  echo "$j" > "$d/last-$1.json"
+  # The last one that worked, kept apart: a failed or skipped run doesn't
+  # make parity look out of date further back than it is.
+  [ "$2" = true ] && echo "$j" > "$d/last-ok-$1.json"
+  return 0
+}
+what=$([ "$job" = sync ] && echo "Parity sync" || echo "Parity check")
+action=$([ "$job" = sync ] && echo parity-sync || echo parity-check)
+# Paused while a disk is being replaced (Homestack's Replace disk): a sync
+# halfway through a rebuild would drop the files not yet restored.
+HOLD=${HOMESTACK_HOLD:-/var/lib/homestack-agent/storage-hold}
+if [ -s "$HOLD" ]; then
+  if [ -t 0 ]; then echo "Paused: $(cat "$HOLD")"; else
+    "$N" -l warning -t "$what skipped" "Paused while a disk is replaced: $(cat "$HOLD")"; fi
+  exit 1
+fi
+# Cron waits up to an hour for the mover etc. to finish; a button press doesn't wait.
+if ! array_lock "$what"; then
+  if [ -z "${HOMESTACK_AGENT_JOB:-}" ] && [ ! -t 0 ]; then
+    flock -w 3600 9 || { "$N" -l warning -t "$what skipped" "Another storage task ran for over an hour."; exit 1; }
+    : > /run/lock/homestack-array.lock; echo "$what" >> /run/lock/homestack-array.lock
+  else
+    echo "Another storage task is running: $(cat /run/lock/homestack-array.lock)"; exit 1
+  fi
+fi
+
+if pgrep -x snapraid >/dev/null; then
+  "$N" -l warning -t "$what skipped" "SnapRAID is already running in a terminal. It'll run again next time."; exit 1
+fi
+
+start_run_log "$action" "$log"
+log=$RUNLOG
+echo "$what started $(date '+%F %T')${HOMESTACK_AGENT_JOB:+ from Homestack}." > "$log"
+
+# Never update parity from an incomplete array: a disk that isn't mounted
+# looks to SnapRAID like every file on it was deleted.
+. "${LAYOUT_CONF:-/etc/default/homestack-layout}" 2>/dev/null # where the storage is (Settings → Storage)
+CONF=${SNAPRAID_CONF:-${STORAGE_SNAPRAID:-/etc/snapraid.conf}}
+problems=""
+while read -r kw name path; do
+  case "$kw" in data|disk) mountpoint -q "${path%/}" || problems+="• data disk $name (${path}) isn't mounted"$'\n' ;; esac
+done < <(grep -E '^(data|disk)[[:space:]]' "$CONF")
+while read -r kw path; do
+  mountpoint -q "$(dirname "${path%%,*}")" || problems+="• parity (${path}) isn't mounted"$'\n'
+done < <(grep -E '^[0-9a-z-]*parity[[:space:]]' "$CONF")
+unhealthy=$(zpool status -x 2>/dev/null)
+grep -q "all pools are healthy" <<<"$unhealthy" || problems+="• a ZFS pool isn't healthy: $(head -c 300 <<<"$unhealthy")"$'\n'
+if [ -n "$problems" ]; then
+  printf 'Refused: the array is not complete, so parity was left untouched.\n%s' "$problems" >> "$log"
+  "$N" -l error -t "$what refused: array not complete" "Parity was left untouched."$'\n\n'"$problems"
+  record_result "$action" false "Refused: $problems"
+  exit 1
+fi
+
+start=$(date +%s)
+elapsed() { local t=$(( $(date +%s) - start )); printf '%dh %02dm' $((t / 3600)) $((t % 3600 / 60)); }
+count() { sed -n "s/^ *\([0-9][0-9]*\) $1\$/\1/p" <<<"$2" | head -1; }
+
+# With `snapshot` (SnapRAID 15), SnapRAID reads ZFS data disks through its own
+# snapshots (snapraid-scan, -pending, -stable), which ZFS mounts when they're
+# read. SnapRAID never unmounts them (ZFS does after 5 idle minutes, and a
+# failed run leaves them on purpose), and ZFS counts a snapshot as mounted if
+# it's mounted anywhere, in any mount namespace. A container started while
+# one was mounted keeps its own copy (Docker binds are rprivate by default,
+# so the host's unmounts never reach it). Then SnapRAID can't open that
+# disk's snapshots by their new names after renaming them ("Too many levels
+# of symbolic links") and the sync stops before parity is touched. So
+# SnapRAID's snapshot mounts are released before each run, on the host and
+# in every other mount namespace, and nothing else is touched. Harmless: ZFS
+# mounts a snapshot again when it's next read, and no SnapRAID is running
+# (the lock, and the check above).
+PROC=${PROC_ROOT:-/proc}
+snapshot_mounts() { # mounts file → SnapRAID's snapshot mount points, one per line
+  local mp
+  while read -r _ mp _; do
+    case "$mp" in */.zfs/snapshot/snapraid-*) printf '%b\n' "$mp" ;; esac # \040 is a space
+  done < "$1"
+}
+holder() { # /proc/PID → who it is: "container diskindexer", "polkitd (pid 3811)"
+  local id name
+  id=$(grep -o -m1 -E 'docker[-/][0-9a-f]{12,64}' "$1/cgroup" 2>/dev/null | cut -c8-19)
+  if [ -n "$id" ]; then
+    name=$(docker ps --filter "id=$id" --format '{{.Names}}' 2>/dev/null | head -1)
+    echo "container ${name:-$id}"
+  else
+    echo "$(cat "$1/comm" 2>/dev/null) (pid ${1##*/})"
+  fi
+}
+release_snapshots() {
+  local mp p ns self who fix seen=" "
+  while IFS= read -r mp; do
+    umount "$mp" 2>/dev/null || echo "Couldn't unmount $mp: something has it open (fuser -vm $mp shows what)." >> "$log"
+  done < <(snapshot_mounts "$PROC/mounts")
+  # Copies elsewhere. systemd's sandboxed services follow the host's
+  # unmounts, so what's left by now is held apart, usually by a container.
+  self=$(readlink "$PROC/self/ns/mnt")
+  for p in "$PROC"/[0-9]*; do
+    ns=$(readlink "$p/ns/mnt" 2>/dev/null) || continue
+    [ "$ns" != "$self" ] || continue
+    case "$seen" in *" $ns "*) continue ;; esac
+    seen+="$ns "
+    while IFS= read -r mp; do
+      who=$(holder "$p") fix=""
+      [[ $who == container* ]] && fix=" Give its disk binds :rslave, so it follows the host's unmounts."
+      if umount -N "${p##*/}" "$mp" 2>/dev/null; then
+        echo "Unmounted $mp in $who, which had kept its own copy.$fix" >> "$log"
+      else
+        echo "Couldn't unmount $mp in $who: restart it.$fix" >> "$log"
+      fi
+    done < <(snapshot_mounts "$p/mounts" 2>/dev/null)
+  done
+}
+# snap runs SnapRAID into the log, rc its exit code. If a sync still trips
+# over a snapshot (one was mounted again during the run), the snapshots are
+# released and it's run once more.
+snap() { # snapraid arguments
+  release_snapshots
+  snapraid -c "$CONF" "$@" >> "$log" 2>&1; rc=$?
+  if [ $rc -ne 0 ] && [ "$1" = sync ] && tail -50 "$log" | grep -q 'snapshot.*Too many levels of symbolic links'; then
+    echo "SnapRAID couldn't open one of its ZFS snapshots: ZFS counts it as mounted somewhere. Releasing them again and trying once more." >> "$log"
+    release_snapshots
+    snapraid -c "$CONF" "$@" >> "$log" 2>&1; rc=$?
+    if [ $rc -ne 0 ] && tail -20 "$log" | grep -q 'snapshot.*Too many levels of symbolic links'; then
+      echo "ZFS still counts one of SnapRAID's snapshots as mounted. Find what holds it: sudo grep -l 'snapshot/snapraid-' /proc/*/mounts" >> "$log"
+    fi
+  fi
+}
+
+case $job in
+  sync)
+    # First sync ever (no content file yet): nothing to compare with, and
+    # listing every file first would only double the scan. Skip the diff.
+    first=yes
+    while read -r _ c; do [ -s "$c" ] && first=no; done < <(grep -E '^content[[:space:]]' "$CONF")
+    if [ $first = yes ]; then
+      "$N" -t "First parity sync started" "Building parity for every file on the array. This takes many hours; progress is on Homestack's Storage page."
+      echo "First sync: no content file yet, so every file is new." >> "$log"
+      snap sync
+      changes="First sync"
+    else
+    echo "Checking what changed since the last sync…" >> "$log"
+    # Its exit code says whether a sync is needed: 0 no, 2 yes, anything else
+    # failed. Trust that, not the file counts: after an interrupted sync they
+    # can all be 0 while parity is still unfinished ("The last sync was
+    # interrupted. Run it again!").
+    diff=$(snapraid -c "$CONF" diff 2>&1); drc=$?
+    if { [ $drc -ne 0 ] && [ $drc -ne 2 ]; } || ! grep -qE '^ *[0-9]+ equal$' <<<"$diff"; then
+      tail -30 <<<"$diff" >> "$log"
+      record_result "$action" false "snapraid diff failed (exit $drc), so the sync didn't start."
+      "$N" -l error -t "Parity sync failed to start" "\`snapraid diff\` failed (exit $drc):"$'\n```\n'"$(tail -15 <<<"$diff")"$'\n```'
+      exit 1
+    fi
+    # relocated (SnapRAID 14 and on): a file that moved to another disk, its original gone.
+    grep -E '^ *[0-9]+ (equal|added|removed|updated|moved|copied|relocated|restored)$|interrupted' <<<"$diff" >> "$log"
+    added=$(count added "$diff") removed=$(count removed "$diff") updated=$(count updated "$diff") moved=$(count moved "$diff")
+    changes="${added:-0} added, ${removed:-0} removed, ${updated:-0} updated, ${moved:-0} moved"
+    for k in copied relocated restored; do
+      n=$(count "$k" "$diff"); [ "${n:-0}" -gt 0 ] && changes+=", $n $k"
+    done
+    if [ $drc -eq 0 ]; then
+      record_result "$action" true "Nothing changed since the last sync."
+      exit 0                                    # parity is complete and current: stay quiet
+    fi
+    if grep -q 'interrupted' <<<"$diff"; then
+      if grep -qE '^ *[1-9][0-9]* (added|removed|updated|moved|copied|relocated|restored)$' <<<"$diff"; then
+        changes="The last sync didn't finish, so this one completes it. $changes"
+      else
+        changes="The last sync didn't finish, so this one completes it"
+      fi
+    fi
+    if (( ${removed:-0} > SNAPRAID_DELETE_LIMIT )) && [ $force = no ]; then
+      record_result "$action" false "Skipped: ${removed} files were deleted (limit ${SNAPRAID_DELETE_LIMIT}). Sync anyway from Storage if that was intended."
+      "$N" -l error -t "Parity sync skipped: many files deleted" \
+        "${removed} files were deleted since the last sync (limit ${SNAPRAID_DELETE_LIMIT}). Parity still protects them, so check nothing was deleted by mistake. If it was intended, run: \`snapraid-job sync --force\`"
+      exit 1
+    fi
+    if (( ${updated:-0} > SNAPRAID_UPDATE_LIMIT )) && [ $force = no ]; then
+      record_result "$action" false "Skipped: ${updated} files were modified (limit ${SNAPRAID_UPDATE_LIMIT}). Sync anyway from Storage if that was intended."
+      "$N" -l error -t "Parity sync skipped: many files modified" \
+        "${updated} files changed since the last sync (limit ${SNAPRAID_UPDATE_LIMIT}). Parity still has the old versions, so check they weren't encrypted or corrupted. If it was intended, run: \`snapraid-job sync --force\`"
+      exit 1
+    fi
+    "$N" -t "Parity sync started" "$changes."
+    snap sync
+    fi
+    ;;
+  scrub)
+    "$N" -t "Parity check started" "Scrubbing ${SNAPRAID_SCRUB_PERCENT}% of the array (blocks not checked for ${SNAPRAID_SCRUB_AGE}+ days)."
+    snap scrub -p "$SNAPRAID_SCRUB_PERCENT" -o "$SNAPRAID_SCRUB_AGE"
+    ;;
+  *) echo "usage: snapraid-job sync [--force] | scrub" >&2; exit 2 ;;
+esac
+
+result=$(grep -E 'Everything OK|errors|WARNING|DANGER|Nothing to do' "$log" | tail -5)
+# A container that kept a copy of a snapshot (released above): worth fixing.
+kept=$(grep -h 'kept its own copy' "$log" | sort -u | head -2)
+[ -z "$kept" ] || result+=$'\n\n'"$kept"
+if [ $rc -eq 0 ] && ! grep -qE 'DANGER|[1-9][0-9]* (data|io) errors' "$log"; then
+  "$N" -l success -t "$what finished" "Took $(elapsed).${changes:+ $changes.}"$'\n'"${result}"
+  record_result "$action" true "Took $(elapsed).${changes:+ $changes.}"
+else
+  "$N" -l error -t "$what failed" "Exit code $rc after $(elapsed). Last lines of $log:"$'\n```\n'"$(tail -15 "$log")"$'\n```'
+  record_result "$action" false "Failed (exit $rc): $(tail -3 "$log")"
+  exit 1
+fi

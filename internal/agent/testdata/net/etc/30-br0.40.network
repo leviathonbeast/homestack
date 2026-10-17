@@ -1,0 +1,7 @@
+[Match]
+Name=br0.40
+
+[Network]
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+ConfigureWithoutCarrier=yes

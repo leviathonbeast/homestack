@@ -1,0 +1,5 @@
+[Match]
+Name=bond0.40
+
+[Network]
+Bridge=br0.40

@@ -1,0 +1,5 @@
+# Always LF, even in a Windows checkout (Git for Windows sets
+# core.autocrlf=true): the scripts, cron files and units here run on Linux,
+# and a copy of a CRLF working tree breaks them ("set: pipefail: invalid
+# option name").
+* text=auto eol=lf

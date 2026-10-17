@@ -1,0 +1,7 @@
+# VLAN 40 ("VMS"), carried over the bond.
+[NetDev]
+Name=bond0.40
+Kind=vlan
+
+[VLAN]
+Id=40

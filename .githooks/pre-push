@@ -1,0 +1,4 @@
+#!/bin/sh
+# Everything, before it leaves this machine (scripts/check.sh): tests, known
+# vulnerabilities, latest releases. `git push --no-verify` skips it once.
+exec bash "$(git rev-parse --show-toplevel)/scripts/check.sh"

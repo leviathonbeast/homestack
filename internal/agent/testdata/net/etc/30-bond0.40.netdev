@@ -1,0 +1,6 @@
+[NetDev]
+Name=bond0.40
+Kind=vlan
+
+[VLAN]
+Id=40

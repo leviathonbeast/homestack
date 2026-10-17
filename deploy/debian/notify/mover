@@ -1,0 +1,119 @@
+#!/bin/bash
+# Moves files older than MOVER_AGE_MIN minutes from the cache to the array
+# disks, like Unraid's mover, and sends a summary when it's done (like Mover
+# Tuning). Runs nightly from /etc/cron.d/homestack-alerts; safe to run by hand.
+. "${ALERTS_CONF:-/etc/default/homestack-alerts}" 2>/dev/null
+# Once shares are managed in Homestack, its "Move to the array nightly"
+# switches decide which shares move, and Settings → Storage sets the age
+# (this file overrides MOVER_SHARES and MOVER_AGE_MIN).
+MSF=${MOVER_SHARES_FILE:-/etc/default/homestack-mover-shares}
+[ -r "$MSF" ] && . "$MSF"
+: "${MOVER_SHARES:=}" "${MOVER_AGE_MIN:=1440}"
+[[ $MOVER_AGE_MIN =~ ^[0-9]+$ ]] || MOVER_AGE_MIN=1440
+# Where the storage is (Settings → Storage; written by the agent).
+. "${LAYOUT_CONF:-/etc/default/homestack-layout}" 2>/dev/null
+CACHE=${CACHE:-${STORAGE_CACHE:-/mnt/cache}} ARRAY=${ARRAY:-${STORAGE_ARRAY:-/mnt/user-array}}
+N=${NOTIFY:-/usr/local/sbin/notify-discord}
+
+age_text() { # minutes → "3 hours", "90 minutes", "1 day"
+  local m=$1 n u
+  if (( m >= 1440 && m % 1440 == 0 )); then n=$((m / 1440)) u=day
+  elif (( m >= 60 && m % 60 == 0 )); then n=$((m / 60)) u=hour
+  else n=$m u=minute; fi
+  if [ "$n" = 1 ]; then echo "1 $u"; else echo "$n ${u}s"; fi
+}
+
+# One storage task at a time: the mover, parity jobs, flatten-dataset and
+# Homestack's array controls all share this lock.
+array_lock() { # name
+  exec 9>>/run/lock/homestack-array.lock
+  flock -n 9 || return 1
+  : > /run/lock/homestack-array.lock; echo "$1" >> /run/lock/homestack-array.lock
+}
+json_str() { # text → a JSON string (first 600 bytes)
+  local s; s=$(printf '%s' "$1" | head -c 600)
+  jq -n --arg s "$s" '$s' 2>/dev/null || python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$s" 2>/dev/null || echo '""'
+}
+# One log per run in $RUN_LOGS (Homestack: Storage → History), so a new
+# run never wipes the last one. The fixed path ($2) links to the latest run;
+# older runs are compressed, and the newest LOG_KEEP of each kind are kept.
+start_run_log() { # action fixed-path
+  local dir=${RUN_LOGS:-/var/log/homestack-agent/runs} keep=${LOG_KEEP:-30} f
+  if ! mkdir -p "$dir" 2>/dev/null; then rm -f "$2"; RUNLOG=$2 RUNJSON=""; : > "$RUNLOG"; return 0; fi
+  # A log from before run logs existed becomes the oldest run.
+  if [ -f "$2" ] && [ ! -L "$2" ]; then mv -f "$2" "$dir/$1-$(date -r "$2" +%Y%m%d-%H%M%S).log"; fi
+  for f in "$dir/$1"-*.log; do [ -e "$f" ] && gzip -qf "$f"; done
+  # shellcheck disable=SC2012 # only our own names: <action>-<timestamp>[-<job>].log.gz
+  ls -1t "$dir/$1"-*.log.gz 2>/dev/null | tail -n +"$keep" | while read -r f; do rm -f -- "$f" "${f%.log.gz}.json"; done
+  RUNLOG="$dir/$1-$(date +%Y%m%d-%H%M%S)${HOMESTACK_AGENT_JOB:+-$HOMESTACK_AGENT_JOB}.log"
+  RUNJSON="${RUNLOG%.log}.json"
+  : > "$RUNLOG"
+  ln -sfn "$RUNLOG" "$2"
+}
+record_result() { # action ok(true/false) summary
+  echo "== $([ "$2" = true ] && echo OK || echo FAILED): $3"   # into the run log, through tee
+  [ -n "${RUNJSON:-}" ] && printf '{"finished":"%s","ok":%s,"summary":%s}\n' "$(date -Iseconds)" "$2" "$(json_str "$3")" > "$RUNJSON"
+  local d=/var/lib/homestack-agent; mkdir -p "$d" 2>/dev/null || return 0
+  printf '{"finished":"%s","ok":%s,"summary":%s}\n' "$(date -Iseconds)" "$2" "$(json_str "$3")" > "$d/last-$1.json"
+}
+HOLD=${HOMESTACK_HOLD:-/var/lib/homestack-agent/storage-hold}
+[ -s "$HOLD" ] && { echo "The mover is paused while a disk is replaced: $(cat "$HOLD")"; exit 0; }
+array_lock "Mover" || { echo "Another storage task is running (see /run/lock/homestack-array.lock); the mover will run next time."; exit 0; }
+# SnapRAID started by hand in a terminal doesn't take the lock, so look for it too.
+if pgrep -x snapraid >/dev/null; then echo "SnapRAID is running; the mover will run next time."; exit 0; fi
+mountpoint -q "$ARRAY" || [ -n "$MOVER_TEST" ] || { "$N" -l error -t "Mover didn't run" "$ARRAY isn't mounted."; exit 1; }
+
+# A log of this run (shown by Homestack's Log button), also printed.
+LOGF=${MOVER_LOG:-/var/log/homestack-mover.log}
+start_run_log mover "$LOGF"
+exec > >(tee -a "$RUNLOG") 2>&1
+echo "Mover started $(date '+%F %T')${HOMESTACK_AGENT_JOB:+ from Homestack}: moving files older than $(age_text "$MOVER_AGE_MIN") from $CACHE to $ARRAY"
+echo "Shares: ${MOVER_SHARES:-none yet (switch on Move to the array nightly for a share on the Shares page)}"
+start=$(date +%s)
+[ "$MOVER_NOTIFY_START" = yes ] && "$N" -t "Mover started" "Moving files older than $(age_text "$MOVER_AGE_MIN") from the cache to the array."
+total_files=0 total_bytes=0 failed=0 lines="" errors=""
+
+for share in $MOVER_SHARES; do
+  src="$CACHE/$share"
+  [ -d "$src" ] || continue
+  list=$(mktemp)
+  (cd "$src" && find . -type f -mmin +"$MOVER_AGE_MIN" -print0) > "$list"
+  if [ ! -s "$list" ]; then rm -f "$list"; echo "== $share: nothing old enough to move"; continue; fi
+  echo "== $share: $(tr -cd '\0' < "$list" | wc -c) files to move"
+  out=$(cd "$src" && rsync -aHX --numeric-ids --from0 --files-from="$list" --remove-source-files --stats --out-format='   moved %n (%l bytes)' ./ "$ARRAY/$share/" 2>&1)
+  rc=$?
+  grep -E '^   moved |error|failed|denied|vanished' <<<"$out" | grep -v '^   moved .*/ (' | head -2000
+  rm -f "$list"
+  files=$(sed -n 's/^Number of regular files transferred: \([0-9,]*\).*/\1/p' <<<"$out" | tr -d ,)
+  bytes=$(sed -n 's/^Total transferred file size: \([0-9,]*\).*/\1/p' <<<"$out" | tr -d ,)
+  files=${files:-0} bytes=${bytes:-0}
+  total_files=$((total_files + files)) total_bytes=$((total_bytes + bytes))
+  lines+="• **$share**: $files files, $(numfmt --to=iec --suffix=B "$bytes")"$'\n'
+  if [ $rc -ne 0 ]; then
+    failed=1
+    errors+="$share (rsync exit $rc): $(grep -iE 'error|failed|denied' <<<"$out" | head -3)"$'\n'
+  fi
+  # Tidy folders the move emptied, but only ones that now exist on the array,
+  # so an empty folder an app relies on never disappears from /mnt/user.
+  (cd "$src" && find . -mindepth 1 -depth -type d -empty -print0) |
+    while IFS= read -r -d '' d; do [ -d "$ARRAY/$share/$d" ] && rmdir "$src/$d" 2>/dev/null; done
+done
+
+echo "Done $(date '+%F %T')."
+took=$(( $(date +%s) - start ))
+dur=$(printf '%dh %02dm %02ds' $((took / 3600)) $((took % 3600 / 60)) $((took % 60)))
+cachefree=$(df -h --output=avail "$CACHE" 2>/dev/null | tail -1 | tr -d ' ')
+summary="Moved **$total_files files ($(numfmt --to=iec --suffix=B "$total_bytes"))** in $dur."$'\n\n'"$lines"$'\n'"Cache free now: ${cachefree:-?}"
+
+if [ $failed -ne 0 ]; then
+  "$N" -l error -t "Mover finished with errors" "$summary"$'\n\n'"**Problems:**"$'\n'"$errors"
+  record_result mover false "Moved $total_files files with errors: $errors"
+  exit 1
+elif [ $total_files -gt 0 ]; then
+  "$N" -l success -t "Mover finished" "$summary"
+  record_result mover true "Moved $total_files files ($(numfmt --to=iec --suffix=B "$total_bytes")) in $dur."
+else
+  [ "$MOVER_NOTIFY_EMPTY" = yes ] && "$N" -t "Mover finished" "Nothing needed moving. Cache free: ${cachefree:-?}"
+  record_result mover true "Nothing needed moving."
+fi
+exit 0

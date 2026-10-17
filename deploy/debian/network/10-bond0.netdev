@@ -1,0 +1,10 @@
+# bond0: two ports, active-backup, as on Unraid. MACAddress: the first
+# port's, so the router keeps seeing the address it knows.
+[NetDev]
+Name=bond0
+Kind=bond
+MACAddress=00:00:5e:00:53:01
+
+[Bond]
+Mode=active-backup
+MIIMonitorSec=100ms

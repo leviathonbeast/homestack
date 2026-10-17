@@ -1,0 +1,8 @@
+# The two bond ports, matched by their burned-in MAC addresses (Debian names
+# ports differently from Unraid: eth0/eth1 become enpXsYf0/f1). Put your own
+# here: `ip -br link` lists them, and a bonded port shows its own as permaddr.
+[Match]
+PermanentMACAddress=00:00:5e:00:53:01 00:00:5e:00:53:02
+
+[Network]
+Bond=bond0

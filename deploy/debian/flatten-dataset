@@ -1,0 +1,159 @@
+#!/bin/bash
+# Turns one ZFS share dataset (e.g. disk3/Music) into a plain folder in its
+# pool's top level (/mnt/disk3/Music), so SnapRAID can protect it. SnapRAID
+# skips anything on a different filesystem, and each dataset counts as one.
+#
+#   sudo flatten-dataset disk3/Music          do it
+#   sudo flatten-dataset --undo disk3/Music   put the dataset back if a run stopped halfway
+#
+# How: the dataset is mounted aside and its files are copied into the new
+# folder with copy_file_range, which ZFS turns into block cloning between
+# datasets of the same pool (instant, no extra space). If the share is too big
+# to fit twice, it first proves cloning works with a test file, and a watchdog
+# stops the copy if free space drops more than cloning could explain. Both
+# sides are compared file by file, and only then is the dataset (and its
+# snapshots) destroyed.
+set -euo pipefail
+ZFS=${ZFS:-zfs}
+ZPOOL=${ZPOOL:-zpool}
+ASIDE=${ASIDE:-/mnt/.flatten}
+
+die() { echo "flatten-dataset: $*" >&2; exit 1; }
+undo=no
+[ "${1:-}" = --undo ] && { undo=yes; shift; }
+ds=${1:?usage: flatten-dataset [--undo] POOL/SHARE}
+pool=${ds%%/*}
+share=${ds#*/}
+[ "$ds" != "$pool" ] && [[ "$share" != */* ]] || die "give a share dataset directly under a pool, like disk3/Music"
+root=$($ZFS get -H -o value mountpoint "$pool")
+target="$root/$share"
+aside="$ASIDE/$pool-$share"
+[ "$(id -u)" = 0 ] || [ -n "${FLATTEN_TEST:-}" ] || die "run with sudo"
+
+if [ $undo = yes ]; then
+  [ "$($ZFS get -H -o value mountpoint "$ds")" = "$aside" ] || die "$ds isn't mounted aside; nothing to undo"
+  echo "Removing the partial copy in $target and mounting $ds back there..."
+  # Only remove what the copy created: everything in $target, which was empty before.
+  find "$target" -mindepth 1 -delete
+  $ZFS set mountpoint="$target" "$ds"
+  rmdir "$aside" 2>/dev/null || true
+  echo "Undone: $ds is back at $target."
+  exit 0
+fi
+
+[ "$($ZFS get -H -o value mountpoint "$ds")" = "$target" ] || die "$ds isn't mounted at $target"
+# Anything with files open on this share? (mergerfs counts: it means someone
+# has a file open through /mnt/user.)
+if mountpoint -q "$target" && command -v fuser >/dev/null; then
+  pids=$(fuser -m "$target" 2>/dev/null | tr -s ' ' | sed 's/^ //') || true
+  if [ -n "$pids" ]; then
+    echo "Programs using $target:"
+    for p in $pids; do p=${p%%[!0-9]*}; [ -n "$p" ] && echo "  $p $(cat "/proc/$p/comm" 2>/dev/null)"; done
+    die "stop them first (containers using this share, Samba clients), then run again"
+  fi
+fi
+
+if [ -z "${FLATTEN_TEST:-}" ]; then
+  exec 9>>/run/lock/homestack-array.lock
+  flock -n 9 || die "another storage task is running: $(cat /run/lock/homestack-array.lock)"
+  : > /run/lock/homestack-array.lock; echo "Flattening $ds" >> /run/lock/homestack-array.lock
+fi
+
+files=$(find "$target" -xdev \( -type f -o -type l \) | wc -l)
+size=$($ZFS get -H -o value used "$ds")
+echo "== $ds: $files files, $size =="
+
+echo "1/4 Mounting the dataset aside at $aside"
+mkdir -p "$ASIDE"
+$ZFS set mountpoint="$aside" "$ds"
+mkdir -p "$target"
+if [ -n "$(ls -A "$target")" ]; then
+  $ZFS set mountpoint="$target" "$ds"
+  die "$target already has files of its own (hidden under the dataset). Put back as it was; sort those out first."
+fi
+chown --reference="$aside" "$target"; chmod --reference="$aside" "$target"
+
+used=$($ZFS get -Hp -o value used "$ds")
+free=$($ZPOOL get -Hp -o value free "$pool")
+must_clone=no
+(( used + used / 10 + (1 << 30) > free )) && must_clone=yes
+
+if [ $must_clone = yes ]; then
+  # ZFS only clones between datasets with the same record size. (A small
+  # share that fits twice is simply copied, so this doesn't matter there.)
+  [ "$($ZFS get -H -o value recordsize "$ds")" = "$($ZFS get -H -o value recordsize "$pool")" ] ||
+    die "$ds and $pool have different record sizes, so blocks can't be cloned, and there isn't room to copy it"
+  echo "    $ds is too big to copy in full, so checking block cloning works first"
+  # ZFS tidies clone records from earlier shares in the background, which
+  # moves the counter too. Wait until it has stopped changing.
+  settle() {
+    local a b n=0
+    $ZPOOL sync "$pool"; a=$($ZPOOL get -Hp -o value bcloneused "$pool")
+    while :; do
+      sleep "${SETTLE_SECS:-15}"; $ZPOOL sync "$pool"; b=$($ZPOOL get -Hp -o value bcloneused "$pool")
+      [ "$a" = "$b" ] && return 0
+      (( ++n == 1 )) && echo "    waiting for ZFS to finish tidying up after the previous share…"
+      (( n > 240 )) && return 1
+      a=$b
+    done
+  }
+  settle || { $ZFS set mountpoint="$target" "$ds"; rmdir "$aside" 2>/dev/null || true; die "ZFS was still busy after an hour; try again later. Put back as it was."; }
+  t="$aside/.flatten-clone-test"
+  head -c $((64 << 20)) /dev/urandom > "$t"; sync
+  $ZPOOL sync "$pool"; before=$($ZPOOL get -Hp -o value bcloneused "$pool")
+  cp --reflink=auto "$t" "$target/.flatten-clone-test"; sync
+  $ZPOOL sync "$pool"; after=$($ZPOOL get -Hp -o value bcloneused "$pool")
+  rm -f "$t" "$target/.flatten-clone-test"
+  if (( after - before < (60 << 20) )); then
+    $ZFS set mountpoint="$target" "$ds"; rmdir "$aside" 2>/dev/null || true
+    die "block cloning didn't happen on $pool (bcloneused went from $before to $after). Put back as it was; nothing copied."
+  fi
+  echo "    cloning works"
+fi
+
+echo "2/4 Copying (cloning) files into $target (the share is unavailable until this finishes)"
+# Watchdog. Cloning still writes a little: new block pointers and clone
+# records, a few percent of what's cloned (more on 128K-block pools). A real
+# copy uses as much space as it copies. So: stop if free space drops by more
+# than 5 GiB + 5% of what has been cloned so far, or if the pool gets close to
+# full. (A share small enough to fit twice may be copied for real.)
+bstart=$($ZPOOL get -Hp -o value bcloneused "$pool")
+size_pool=$($ZPOOL get -Hp -o value size "$pool")
+floor=$(( size_pool / 50 )); (( floor < (100 << 30) )) && floor=$((100 << 30))   # keep ≥2% (min 100 GiB) free
+start=$(date +%s)
+cp -a --reflink=auto "$aside/." "$target/" &
+cp_pid=$!
+tripped=""
+while kill -0 $cp_pid 2>/dev/null; do
+  sleep 5
+  now_free=$($ZPOOL get -Hp -o value free "$pool")
+  if (( now_free < floor )); then tripped="the pool is nearly full ($(numfmt --to=iec "$now_free") free)"; fi
+  if [ $must_clone = yes ] && [ -z "$tripped" ]; then
+    cloned=$(( $($ZPOOL get -Hp -o value bcloneused "$pool") - bstart )); (( cloned < 0 )) && cloned=0
+    drop=$(( free - now_free ))
+    if (( drop > (5 << 30) + cloned / 20 )); then
+      tripped="free space dropped by $(numfmt --to=iec $drop) while only $(numfmt --to=iec $cloned) was cloned, so files were being copied, not cloned"
+    fi
+  fi
+  if [ -n "$tripped" ]; then kill $cp_pid 2>/dev/null; break; fi
+done
+wait $cp_pid && rc=0 || rc=$?
+if [ -n "$tripped" ]; then
+  die "stopped: $tripped. Nothing was deleted. Run: sudo flatten-dataset --undo $ds"
+fi
+[ "$rc" = 0 ] || die "copy failed. Nothing was deleted. Run: sudo flatten-dataset --undo $ds"
+$ZPOOL sync "$pool" 2>/dev/null || true
+echo "    took $(( $(date +%s) - start ))s; $pool free space went from $(numfmt --to=iec "$free") to $(numfmt --to=iec "$($ZPOOL get -Hp -o value free "$pool")")"
+
+echo "3/4 Comparing both sides (names, types, sizes, times, owners, permissions)"
+list() { (cd "$1" && find . -xdev -mindepth 1 \( -type f -o -type l -o -type d \) -printf '%P\t%y\t%s\t%T@\t%U:%G\t%m\n' | LC_ALL=C sort); }
+if ! diff -q <(list "$aside") <(list "$target") >/dev/null; then
+  echo "Differences (first 20):"; diff <(list "$aside") <(list "$target") | head -20
+  die "the copy doesn't match. Nothing was deleted. Run: sudo flatten-dataset --undo $ds"
+fi
+echo "    $(list "$target" | wc -l) entries match"
+
+echo "4/4 Destroying the old dataset $ds (and its snapshots)"
+$ZFS destroy -r "$ds"
+rmdir "$aside" 2>/dev/null || true
+echo "Done: $target is now a plain folder in $pool."

@@ -1,0 +1,35 @@
+# Homestack host agent: the Storage and Fans pages. Runs as root on the host
+# (never in Docker) and talks to Homestack over /run/homestack/agent.sock.
+# Installed by deploy/debian/agent/install.sh.
+
+[Unit]
+Description=Homestack host agent (storage, parity, fans, network)
+After=zfs-mount.service local-fs.target
+# Up before Docker, so /run/homestack exists when Homestack starts.
+Before=docker.service
+# Not tied to the array mounts on purpose: it has to keep running while the
+# array is stopped so you can start it again from the web page.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/homestack/homestack agent
+# Whatever happens to the agent (crash, stop, update), every fan header goes
+# back to the BIOS's own control.
+ExecStopPost=/usr/local/lib/homestack/homestack agent restore-fans
+# A network change that nobody kept is undone when the agent stops, too.
+ExecStopPost=/usr/local/lib/homestack/homestack agent restore-network
+# Where Homestack's settings and source are: homestack-agent.service.d/paths.conf,
+# written by install.sh.
+Restart=always
+RestartSec=5
+# Its jobs (parity sync, mover) run in their own process group; let them
+# finish their own clean-up when the agent is stopped.
+KillMode=mixed
+TimeoutStopSec=90
+RuntimeDirectory=homestack
+RuntimeDirectoryPreserve=yes
+StateDirectory=homestack-agent
+LogsDirectory=homestack-agent
+
+[Install]
+WantedBy=multi-user.target

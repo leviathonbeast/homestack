@@ -1,0 +1,35 @@
+#!/bin/bash
+# Reports disks running hot. Sleeping disks are skipped, never woken.
+# Runs every 10 minutes from /etc/cron.d/homestack-alerts.
+. "${ALERTS_CONF:-/etc/default/homestack-alerts}" 2>/dev/null
+: "${TEMP_WARN:=45}" "${TEMP_CRIT:=50}" "${SSD_TEMP_WARN:=60}" "${SSD_TEMP_CRIT:=70}" "${NVME_TEMP_WARN:=65}" "${NVME_TEMP_CRIT:=75}"
+N=${NOTIFY:-/usr/local/sbin/notify-discord}
+STATE=${STATE_DIR:-/var/lib/homestack-alerts}/temp
+mkdir -p "$STATE"
+
+. "${ALERTS_LIB:-/usr/local/lib/homestack/alerts-lib.sh}"
+load_labels
+
+while read -r d tran; do
+  [ "$tran" = usb ] && continue
+  t=$(smartctl -n standby -A -j "/dev/$d" 2>/dev/null | jq -r '.temperature.current // empty' 2>/dev/null)
+  [[ "$t" =~ ^[0-9]+$ ]] || continue          # asleep, or no temperature sensor
+  warn=$TEMP_WARN crit=$TEMP_CRIT                      # hard drives
+  if [[ $d == nvme* ]]; then warn=$NVME_TEMP_WARN crit=$NVME_TEMP_CRIT
+  elif [ "$(cat "${SYSFS:-/sys}/block/$d/queue/rotational" 2>/dev/null)" = 0 ]; then warn=$SSD_TEMP_WARN crit=$SSD_TEMP_CRIT
+  fi
+  prev=$(cat "$STATE/$d" 2>/dev/null || echo ok)
+  if (( t >= crit )); then now=crit
+  elif (( t >= warn )); then now=warn
+  elif (( t <= warn - 3 )); then now=ok
+  else now=$prev; fi                          # between: keep the last state (no flapping)
+  [ "$now" = "$prev" ] && continue
+  name=$(disk_name "$d")
+  who=$(disk_desc "$d")
+  case $now in
+    crit) "$N" -l error -t "Disk too hot: $name" "$who is at **${t}°C**, over the ${crit}°C limit. Check fans and airflow now." ;;
+    warn) if [ "$prev" = crit ]; then "$N" -l warning -t "Disk cooling: $name" "$who is down to ${t}°C, still above ${warn}°C."
+          else "$N" -l warning -t "Disk running warm: $name" "$who is at **${t}°C** (warning at ${warn}°C, critical at ${crit}°C)."; fi ;;
+    ok)   "$N" -l success -t "Disk temperature normal: $name" "$who is back to ${t}°C." ;;
+  esac && echo "$now" > "$STATE/$d"
+done < <(lsblk -dno NAME,TYPE,TRAN | awk '$2 == "disk" {print $1, $3}')

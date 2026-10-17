@@ -1,0 +1,17 @@
+# Timers for UPS events. Installed as /etc/nut/upssched.conf.
+CMDSCRIPT /usr/local/sbin/ups-event
+PIPEFN /run/nut/upssched.pipe
+LOCKFN /run/nut/upssched.lock
+
+# Shut down after @SHUTDOWN_AFTER@ s on battery, unless power returns first.
+AT ONBATT * START-TIMER onbatt-shutdown @SHUTDOWN_AFTER@
+AT ONLINE * CANCEL-TIMER onbatt-shutdown
+
+AT ONBATT   * EXECUTE onbatt
+AT ONLINE   * EXECUTE online
+AT LOWBATT  * EXECUTE lowbatt
+AT FSD      * EXECUTE fsd
+AT COMMOK   * EXECUTE commok
+AT COMMBAD  * EXECUTE commbad
+AT NOCOMM   * EXECUTE nocomm
+AT REPLBATT * EXECUTE replbatt

@@ -1,0 +1,16 @@
+# NUT: the CyberPower VP1600ELCD on USB. Installed as /etc/nut/ups.conf.
+maxretry = 3
+
+[cyberpower]
+  driver = usbhid-ups
+  port = auto
+  vendorid = 0764
+  productid = 0501
+  desc = "CyberPower VP1600ELCD"
+  pollinterval = 15
+  # If the UPS keeps dropping off USB even with autosuspend off, uncomment:
+  # pollonly
+  # Decide "battery low" ourselves instead of trusting the UPS's own flag:
+  ignorelb
+  override.battery.charge.low = @LOW_CHARGE@
+  override.battery.runtime.low = @LOW_RUNTIME@

@@ -1,0 +1,5 @@
+[Match]
+Name=port0 port1
+
+[Network]
+Bond=bond0

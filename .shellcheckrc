@@ -1,0 +1,3 @@
+# The scripts source settings that only exist on the server
+# (/etc/default/homestack-alerts and friends), so ShellCheck can't follow them.
+disable=SC1090,SC1091

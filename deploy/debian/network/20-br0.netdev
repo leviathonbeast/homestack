@@ -1,0 +1,9 @@
+# br0: the main bridge. The host, Docker and anything bridged sit on it.
+[NetDev]
+Name=br0
+Kind=bridge
+MACAddress=00:00:5e:00:53:01
+
+[Bridge]
+STP=no
+ForwardDelaySec=0

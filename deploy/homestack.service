@@ -1,0 +1,31 @@
+# systemd unit for running Homestack as a plain binary (no container).
+#   sudo cp deploy/homestack.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now homestack
+
+[Unit]
+Description=Homestack (Docker Compose manager)
+Documentation=https://github.com/you/homestack
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/homestack
+Environment=HOMESTACK_PORT=5080
+Environment=HOMESTACK_STACKS=/opt/stacks
+Environment=HOMESTACK_DATA=/var/lib/homestack
+# Root is the simplest way to reach the Docker socket. To run as a normal user
+# instead, add them to the docker group and set User= here (and chown the
+# data and stacks folders to them).
+User=root
+Restart=on-failure
+RestartSec=3
+
+# Hardening that doesn't get in the way
+NoNewPrivileges=true
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

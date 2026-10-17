@@ -1,0 +1,17 @@
+# Same addresses, gateways and DNS as on Unraid.
+[Match]
+Name=br0
+
+[Network]
+Address=10.0.10.5/24
+Gateway=10.0.10.1
+Address=2001:db8:0:8a00::5/64
+IPv6AcceptRA=no
+IPv6PrivacyExtensions=no
+DNS=1.1.1.2 193.138.219.74 45.90.28.0
+DNS=2620:fe::11 2a07:e340::4 2606:4700:4700::1112
+ConfigureWithoutCarrier=yes
+
+[Route]
+Gateway=fe80::1
+GatewayOnLink=yes

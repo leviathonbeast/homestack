@@ -1,0 +1,4 @@
+#!/bin/sh
+# Quick offline checks of what's being committed (scripts/check.sh --quick).
+# `git commit --no-verify` skips them once; only for emergencies.
+exec bash "$(git rev-parse --show-toplevel)/scripts/check.sh" --quick

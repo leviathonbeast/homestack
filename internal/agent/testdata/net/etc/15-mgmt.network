@@ -1,0 +1,14 @@
+[Match]
+Name=mgmt0
+
+[Network]
+DNS=1.1.1.2
+ConfigureWithoutCarrier=yes
+
+[Address]
+Address=10.0.10.6/24
+RouteMetric=300
+
+[Route]
+Gateway=10.0.10.1
+Metric=100

@@ -1,0 +1,40 @@
+#!/bin/bash
+# Called by upssched (as the nut user) for UPS events: posts to Discord/ntfy
+# with the battery readings, and starts the shutdown when the on-battery timer
+# runs out. Installed as /usr/local/sbin/ups-event.
+UPS=${UPS_NAME:-cyberpower@localhost}
+N=${NOTIFY:-sudo -n /usr/local/sbin/notify-discord}
+STATE=/run/nut/ups-event.state
+. /etc/default/homestack-ups 2>/dev/null
+: "${UPS_SHUTDOWN_AFTER:=300}"
+
+v() { upsc "$UPS" "$1" 2>/dev/null; }
+readings() {
+  local c r l
+  c=$(v battery.charge) r=$(v battery.runtime) l=$(v ups.load)
+  printf 'Battery %s%%%s, load %s%%.' "${c:-?}" "${r:+, about $((r / 60)) min left}" "${l:-?}"
+}
+say() { $N -l "$1" -t "$2" "$3" >/dev/null 2>&1 || logger -t ups-event "couldn't notify: $2"; }
+
+case "$1" in
+  onbatt)
+    say warning "Power cut: running on battery" "$(readings) The server shuts down cleanly in $((UPS_SHUTDOWN_AFTER / 60)) min if power doesn't come back (sooner if the battery runs low)." ;;
+  online)
+    say success "Power is back" "Running on mains again; the shutdown was called off. $(readings)" ;;
+  lowbatt)
+    say error "UPS battery low: shutting down" "$(readings) Stopping containers, VMs and parity jobs, then powering off." ;;
+  onbatt-shutdown)
+    say error "Still on battery: shutting down" "Power has been off for $((UPS_SHUTDOWN_AFTER / 60)) min. $(readings) Stopping everything cleanly and powering off."
+    sudo -n /usr/sbin/upsmon -c fsd ;;
+  fsd)
+    : ;;  # announced by lowbatt/onbatt-shutdown already
+  nocomm)
+    touch "$STATE.nocomm"
+    say warning "Can't reach the UPS" "The server has lost contact with the UPS for 5 minutes, so a power cut wouldn't shut it down cleanly. Check its USB cable, then: sudo systemctl restart nut-driver.target" ;;
+  commok)
+    [ -e "$STATE.nocomm" ] && { rm -f "$STATE.nocomm"; say success "UPS reconnected" "$(readings)"; } ;;
+  replbatt)
+    say warning "UPS battery needs replacing" "The UPS reports its battery is worn out. Runtime in a power cut will be shorter than expected. $(readings)" ;;
+  commbad) : ;;  # brief dropouts are normal; NOCOMM reports lasting ones
+esac
+exit 0

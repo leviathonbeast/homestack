@@ -1,0 +1,6 @@
+[Match]
+Name=bond0
+
+[Network]
+Bridge=br0
+VLAN=bond0.40

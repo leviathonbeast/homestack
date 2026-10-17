@@ -1,0 +1,45 @@
+# Run Homestack itself with Docker Compose.
+#
+# Keep this file OUTSIDE your stacks folder (for example in /opt/homestack),
+# so Homestack doesn't list itself as a stack you could accidentally stop.
+#
+#   docker compose up -d                              start it
+#   docker compose pull && docker compose up -d       update it
+#
+# Then open http://<server-ip>:5080
+#
+# Built from source instead (from a clone of the repository):
+#   docker build --pull -t ghcr.io/leviathonbeast/homestack:latest . && docker compose up -d
+
+services:
+  homestack:
+    image: ghcr.io/leviathonbeast/homestack:latest
+    container_name: homestack
+    restart: unless-stopped
+
+    # Host networking lets the "Listen on" setting pick your real LAN and
+    # WireGuard interfaces, and shows real client IPs for the allowlist.
+    network_mode: host
+
+    environment:
+      - HOMESTACK_PORT=5080
+      # Your time zone, for schedules and times in logs: set TZ in a .env file
+      # next to this one (TZ=Europe/London), or replace UTC here.
+      - TZ=${TZ:-UTC}
+
+    volumes:
+      # Lets Homestack control Docker. This is effectively root access to the
+      # host, which is why login and the network allowlist matter.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Your account and settings.
+      - ./data:/data
+      # Your stacks. Must be the SAME path on both sides, because Compose
+      # passes paths like ./config to Docker, which resolves them on the host.
+      - /opt/stacks:/opt/stacks
+      # Optional VMs page (KVM through libvirt): libvirt's socket, and a
+      # folder of installer ISOs (set the same folders in Settings).
+      # - /var/run/libvirt:/var/run/libvirt
+      # - /mnt/user/isos:/mnt/user/isos:ro
+      # Optional Storage and Fans pages: the host agent's socket
+      # (deploy/debian/agent/install.sh sets the agent up).
+      # - /run/homestack:/run/homestack
