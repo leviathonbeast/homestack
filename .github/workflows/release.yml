@@ -10,6 +10,8 @@ name: Release
 on:
   push:
     tags: ["v*.*.*"]
+  # Run it again by hand: Actions → Release → Run workflow, on the tag.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,7 +31,7 @@ jobs:
         run: |
           have=$(sed -nE 's/^ARG VERSION=(.+)$/\1/p' Dockerfile)
           if [ "v$have" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::The tag is $GITHUB_REF_NAME, but the Dockerfile says VERSION=$have."
+            echo "::error::Run on $GITHUB_REF_NAME, but the Dockerfile says VERSION=$have. Run it on the tag v$have."
             exit 1
           fi
 

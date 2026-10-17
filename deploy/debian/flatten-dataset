@@ -24,7 +24,9 @@ undo=no
 ds=${1:?usage: flatten-dataset [--undo] POOL/SHARE}
 pool=${ds%%/*}
 share=${ds#*/}
-[ "$ds" != "$pool" ] && [[ "$share" != */* ]] || die "give a share dataset directly under a pool, like disk3/Music"
+if [ "$ds" = "$pool" ] || [[ "$share" == */* ]]; then
+  die "give a share dataset directly under a pool, like disk3/Music"
+fi
 root=$($ZFS get -H -o value mountpoint "$pool")
 target="$root/$share"
 aside="$ASIDE/$pool-$share"

@@ -27,7 +27,7 @@ read -ra extra <<<"${SPACE_MOUNTS:-}"
 mounts+=("${extra[@]}")
 declare -A seen
 for m in "${mounts[@]}"; do
-  [ -n "$m" ] && [ -z "${seen[$m]}" ] || continue
+  if [ -z "$m" ] || [ -n "${seen[$m]}" ]; then continue; fi
   seen[$m]=1
   mountpoint -q "$m" || continue
   read -r pct avail < <(df -h --output=pcent,avail "$m" | tail -1 | tr -d '%')
