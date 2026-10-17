@@ -1,4 +1,9 @@
-# Homestack
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/logo-dark.svg">
+    <img src="docs/logo/logo-light.svg" alt="Homestack" width="400">
+  </picture>
+</p>
 
 A lightweight web UI for managing Docker Compose stacks in a home lab, inspired by Portainer but focused on what a single-server home lab actually uses.
 
