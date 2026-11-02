@@ -21,7 +21,7 @@ COPY . .
 COPY --from=web /src/web/dist ./web/dist
 # Guard: no image from code that fails vet or the tests.
 RUN go vet ./... && go test ./...
-ARG VERSION=0.23.4
+ARG VERSION=0.23.5
 # Where this build's source code is (Homestack is AGPL): a fork sets its own.
 ARG SOURCE_URL=https://github.com/leviathonbeast/homestack
 ARG TARGETOS TARGETARCH
