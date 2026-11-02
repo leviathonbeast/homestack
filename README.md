@@ -67,7 +67,23 @@ If your stacks live somewhere else, change both sides of that volume (for exampl
 
 ## Option B: run the binary directly
 
-You need Go 1.27.2 or newer and Node 24 or newer to build (the Dockerfile uses golang:1.27.2-alpine3.24 and node:24-alpine3.24). The server itself needs Docker with the Compose plugin.
+Each [release](https://github.com/leviathonbeast/homestack/releases) has the binary for amd64 and arm64 (a Raspberry Pi or other 64-bit ARM board), with the systemd unit. The server itself needs Docker with the Compose plugin. To install the latest:
+
+```bash
+ARCH=$(dpkg --print-architecture)   # amd64 or arm64
+URL=https://github.com/leviathonbeast/homestack/releases/latest/download
+curl -fsSL -O "$URL/homestack-linux-$ARCH.tar.gz" -O "$URL/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf "homestack-linux-$ARCH.tar.gz" && cd "homestack-linux-$ARCH"
+sudo install -m 0755 homestack /usr/local/bin/homestack
+sudo install -m 0644 homestack.service /etc/systemd/system/homestack.service
+sudo mkdir -p /opt/stacks /var/lib/homestack
+sudo systemctl daemon-reload && sudo systemctl enable --now homestack
+```
+
+To update, run it again and then `sudo systemctl restart homestack`.
+
+To build it yourself instead, you need Go 1.27.3 or newer and Node 24 or newer (the Dockerfile uses golang:1.27.3-alpine3.24 and node:26-alpine3.24):
 
 ```bash
 make build          # builds the web UI, then bin/homestack

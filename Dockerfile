@@ -21,7 +21,7 @@ COPY . .
 COPY --from=web /src/web/dist ./web/dist
 # Guard: no image from code that fails vet or the tests.
 RUN go vet ./... && go test ./...
-ARG VERSION=0.23.5
+ARG VERSION=0.23.6
 # Where this build's source code is (Homestack is AGPL): a fork sets its own.
 ARG SOURCE_URL=https://github.com/leviathonbeast/homestack
 ARG TARGETOS TARGETARCH
@@ -32,7 +32,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
 #    run `docker compose` against the host's Docker (through the socket).
 FROM alpine:3.24
 LABEL org.opencontainers.image.title="Homestack" \
-      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+    org.opencontainers.image.licenses="AGPL-3.0-or-later"
 # libvirt-client provides virsh, for the optional VMs page. `apk upgrade`
 # picks up security fixes released since the base image was published; build
 # with --pull (`make docker` and compose.yaml do) for the latest base images.

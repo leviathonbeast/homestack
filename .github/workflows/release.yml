@@ -1,7 +1,8 @@
 # On a version tag (v1.2.3): builds the image for amd64 and arm64 and pushes
 # it to ghcr.io/<owner>/<repo>, tagged 1.2.3, 1.2 and latest, with an SBOM and
-# build provenance attached. The Dockerfile runs vet and the tests first, so a
-# failing build publishes nothing.
+# build provenance attached; then the binary for amd64 and arm64, on the tag's
+# GitHub release. The Dockerfile runs vet and the tests first, so a failing
+# build publishes nothing.
 #
 # Actions are pinned to the commit of a release (noted beside it), so a moved
 # tag can't change what runs.
@@ -67,3 +68,64 @@ jobs:
           provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The same build as a plain binary, for running it without Docker (README,
+  # Option B): an archive per architecture with its licences and the systemd
+  # unit, and their checksums. After the image, so the tag's version, vet and
+  # the tests have been checked first. The archives' names have no version in
+  # them, so releases/latest/download/<name> always gets the newest.
+  binaries:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          check-latest: true # not the runner's cached copy, which can lag behind
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable # scripts/check.sh keeps the Dockerfile's on the latest too
+          check-latest: true # not the runner's cached copy, which can lag behind
+          cache-dependency-path: go.sum
+
+      - name: The latest npm
+        run: npm install -g npm@latest --no-audit --no-fund
+
+      - name: Build
+        env:
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          (cd web && npm ci --no-audit --no-fund && npm run build)
+          version=${GITHUB_REF_NAME#v}
+          mkdir -p "$RUNNER_TEMP/release"
+          for arch in amd64 arm64; do
+            name=homestack-linux-$arch
+            mkdir -p "$RUNNER_TEMP/$name"
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=$version -X main.source=$SOURCE_URL" -o "$RUNNER_TEMP/$name/homestack" .
+            cp LICENSE web/public/third-party-notices.txt deploy/homestack.service "$RUNNER_TEMP/$name/"
+            tar -C "$RUNNER_TEMP" --owner=0 --group=0 -czf "$RUNNER_TEMP/release/$name.tar.gz" "$name"
+          done
+          cd "$RUNNER_TEMP/release" && sha256sum -- *.tar.gz > SHA256SUMS
+
+      # Run again by hand on a tag that has a release, it replaces the files.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd "$RUNNER_TEMP/release"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload --clobber "$GITHUB_REF_NAME" ./*.tar.gz SHA256SUMS
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "Homestack ${GITHUB_REF_NAME#v}" --generate-notes ./*.tar.gz SHA256SUMS
+          fi
