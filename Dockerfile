@@ -1,10 +1,10 @@
-# Base images: latest stable releases (Go 1.27.2, Node 24 LTS, Alpine 3.24).
+# Base images: latest stable releases (Go 1.27.3, Node 26 LTS, Alpine 3.24).
 
 # 1. Build the Svelte web UI. On the build machine's own platform: the result
 #    is the same for every image.
-FROM --platform=$BUILDPLATFORM node:24-alpine3.24 AS web
+FROM --platform=$BUILDPLATFORM node:26-alpine3.24 AS web
 # The latest npm, not the one bundled with Node (scripts/check.sh keeps it current).
-RUN npm install -g npm@12.2.0 --no-audit --no-fund
+RUN npm install -g npm@12.2.1 --no-audit --no-fund
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
@@ -13,7 +13,7 @@ RUN npm run build
 
 # 2. Build the Go binary with the UI embedded, on the build machine's own
 #    platform too, cross-compiled for each image's (amd64, arm64).
-FROM --platform=$BUILDPLATFORM golang:1.27.2-alpine3.24 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

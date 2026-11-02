@@ -1,0 +1,7 @@
+# Advisories npm audit reports that scripts/check.sh accepts, one per line:
+#   <advisory> <review by YYYY-MM-DD> <why it's safe here>
+# The check fails on any advisory not listed here, and on a listed one once a
+# fix is out, once npm audit stops reporting it, or after its review date.
+# Accept one only when Homestack can't reach it, and say why.
+
+GHSA-gcqx-w48m-w2h4 2027-01-28 deepmerge (prototype poisoning; no fixed release yet). Only @sveltejs/vite-plugin-svelte uses it, at build time, to merge Homestack's own Svelte config: nothing from outside reaches it, and it isn't in the bundle the browser gets.

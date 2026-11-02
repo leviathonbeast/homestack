@@ -151,6 +151,42 @@ alpine_latest() {
 }
 
 web() { (cd web && "$@"); }
+# npm audit, failing on any advisory web/audit-allow doesn't accept. One it
+# accepts fails again once a fix is out, once npm stops reporting it, or after
+# its review date, so an entry can't outlive its reason. npm audit exits 1
+# whenever it reports anything, so its own status is left to the report.
+npm_audit() {
+  # shellcheck disable=SC2016 # JavaScript, not shell
+  { web npm audit --json 2>/dev/null || true; } | node -e '
+    const fs = require("fs");
+    const problems = [], allowed = new Map(), today = new Date().toISOString().slice(0, 10);
+    fs.readFileSync("web/audit-allow", "utf8").split("\n").forEach((line, i) => {
+      if (/^\s*(#|$)/.test(line)) return;
+      const m = line.match(/^(GHSA-[0-9a-z-]+)\s+(\d{4}-\d{2}-\d{2})\s+\S/);
+      if (m) allowed.set(m[1], m[2]);
+      else problems.push(`web/audit-allow line ${i + 1} should be: <advisory> <review by YYYY-MM-DD> <why it is safe here>`);
+    });
+    let s = "";
+    process.stdin.on("data", (d) => (s += d)).on("end", () => {
+      let report;
+      try { report = JSON.parse(s); } catch { console.log("npm audit did not run."); process.exit(1); }
+      if (report.error) { console.log(`npm audit failed: ${report.error.summary || report.error.code}`); process.exit(1); }
+      const found = new Map();
+      for (const v of Object.values(report.vulnerabilities || {}))
+        for (const via of v.via)
+          if (typeof via === "object") {
+            const id = (via.url || "").split("/").pop() || `npm advisory ${via.source}`;
+            found.set(id, { what: `${v.name}: ${via.title} (${via.url})`, fix: found.get(id)?.fix || v.fixAvailable !== false });
+          }
+      for (const [id, a] of found)
+        if (!allowed.has(id)) problems.push(a.what);
+        else if (a.fix) problems.push(`${id} has a fix now: run npm audit fix in web, and remove it from web/audit-allow.`);
+        else if (allowed.get(id) < today) problems.push(`${id} was to be reviewed by ${allowed.get(id)}: check it is still safe, then set a new date in web/audit-allow.`);
+      for (const id of allowed.keys())
+        if (!found.has(id)) problems.push(`${id} is not reported any more: remove it from web/audit-allow.`);
+      if (problems.length) { console.log(problems.join("\n")); process.exit(1); }
+    });'
+}
 web_deps() { [ -d web/node_modules ] && ((quick)) && return 0; web npm ci --no-audit --no-fund; }
 web_build() {
   local out rc
@@ -208,7 +244,7 @@ if touches '^web/'; then
     check "svelte-check" web npm run check
     if ! ((quick)); then
       check "it builds" web_build
-      check "npm audit: no known vulnerabilities" web npm audit --audit-level=low
+      check "npm audit: no known vulnerabilities, bar those web/audit-allow accepts" npm_audit
       check "npm packages are on their latest releases" web npm outdated
       check "Node is the latest LTS" node_latest
       check "npm is the latest release" npm_latest
